@@ -1,79 +1,102 @@
 import os
-import sys
-from typing import List
-
-# Make project root importable
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(PROJECT_ROOT)
-
-from backend.vector_store import load_faiss_index
 from transformers import pipeline
+from backend.vector_store import load_faiss_index
 
+# -----------------------------
+# HARD LIMITS (TOKEN-SAFE)
+# -----------------------------
+TOP_K = 3
+MAX_CONTEXT_CHARS = 800      # total context
+MAX_CHUNK_CHARS = 220        # per chunk (critical)
 
-def load_llm():
-    """
-    Lightweight local LLM for grounded synthesis.
-    """
-    return pipeline(
-        task="text2text-generation",
-        model="google/flan-t5-base",
-        max_length=512,
-        device=-1  # CPU
-    )
+INDEX_DIR = os.path.join(
+    os.path.dirname(__file__),
+    "..",
+    "vector_store",
+    "faiss_index",
+)
 
+# -----------------------------
+# Load model ONCE
+# -----------------------------
+generator = pipeline(
+    "text2text-generation",
+    model="google/flan-t5-base",
+    max_new_tokens=160,
+    do_sample=False,
+)
 
-def retrieve_documents(query: str, k: int = 4):
-    """
-    Retrieve top-k relevant chunks from FAISS.
-    """
-    index_dir = os.path.join(PROJECT_ROOT, "vector_store", "faiss_index")
-    vectorstore = load_faiss_index(index_dir)
-    return vectorstore.similarity_search(query, k=k)
+# -----------------------------
+# Retrieval
+# -----------------------------
+def retrieve(query: str):
+    vectorstore = load_faiss_index(INDEX_DIR)
+    return vectorstore.similarity_search(query, k=TOP_K)
 
-
-def build_prompt(query: str, docs) -> str:
-    """
-    Build a strictly grounded prompt.
-    """
+# -----------------------------
+# Prompt construction
+# -----------------------------
+def build_prompt(question: str, docs):
     context_blocks = []
+    sources = []
 
-    for i, doc in enumerate(docs, 1):
-        source = doc.metadata["source"]
-        domain = doc.metadata["domain"]
-        page = doc.metadata["page"]
+    total_chars = 0
 
-        block = (
-            f"[Source {i} | {domain} | {source} | page {page}]\n"
-            f"{doc.page_content}"
+    for doc in docs[:TOP_K]:
+        text = doc.page_content.strip()
+        meta = doc.metadata
+
+        if not text:
+            continue
+
+        snippet = text[:MAX_CHUNK_CHARS]
+
+        if total_chars + len(snippet) > MAX_CONTEXT_CHARS:
+            break
+
+        context_blocks.append(snippet)
+        total_chars += len(snippet)
+
+        sources.append(
+            f"{meta.get('source')} "
+            f"({meta.get('domain')}, page {meta.get('page')})"
         )
-        context_blocks.append(block)
 
     context = "\n\n".join(context_blocks)
 
     prompt = f"""
 You are a quantitative finance research assistant.
 
-Answer the question ONLY using the information from the provided sources.
-Do NOT use outside knowledge.
-If the sources do not contain sufficient information, say:
-"Insufficient evidence in the provided documents."
-
-Question:
-{query}
-
-Sources:
+CONTEXT (verbatim excerpts from academic papers):
 {context}
 
-Answer (concise, factual, no speculation):
+QUESTION:
+{question}
+
+ANSWER INSTRUCTIONS:
+- Use ONLY the context above
+- Describe how the concept is operationalized or empirically used in the papers
+- Do NOT give generic or textbook definitions
+- Do NOT speculate or generalize
+- If the context does not explicitly explain the concept, respond EXACTLY with:
+  "Insufficient evidence in the provided documents."
+
+ANSWER:
 """
-    return prompt.strip()
 
+    return prompt, sources
 
-def answer_query(query: str):
-    docs = retrieve_documents(query)
-    prompt = build_prompt(query, docs)
+# -----------------------------
+# Public API
+# -----------------------------
+def answer_query(question: str):
+    docs = retrieve(question)
+    prompt, sources = build_prompt(question, docs)
 
-    llm = load_llm()
-    response = llm(prompt)[0]["generated_text"]
+    output = generator(prompt)[0]["generated_text"].strip()
 
-    return response, docs
+    # Enforce hard refusal if model tries to be vague
+    if len(output.split()) < 6:
+        output = "Insufficient evidence in the provided documents."
+
+    return output, sources
