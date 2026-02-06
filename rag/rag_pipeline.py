@@ -1,105 +1,95 @@
 import os
 import sys
-import warnings
 from typing import List, Tuple
 
-# Silence noisy but harmless warnings
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
-
-# Make backend importable
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(PROJECT_ROOT)
 
 from backend.vector_store import load_faiss_index
-from transformers import pipeline
+from langchain.schema import Document
 
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    TextGenerationPipeline,
+)
 
-# ---------------- CONFIG ----------------
 INDEX_DIR = os.path.join(PROJECT_ROOT, "vector_store", "faiss_index")
-TOP_K = 3
-MAX_CONTEXT_CHARS = 1200   # enough for theory papers
-MAX_CHUNK_CHARS = 400      # handled upstream but documented here
+TOP_K = 6
+MAX_FACT_CHARS = 1200
 
-GEN_MODEL = "google/flan-t5-base"
-# ---------------------------------------
+MODEL_NAME = "microsoft/phi-3-mini-4k-instruct"
+
+# -------------------------
+# Load model SAFELY on Windows
+# -------------------------
+tokenizer = AutoTokenizer.from_pretrained(
+    MODEL_NAME,
+    trust_remote_code=True
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    trust_remote_code=True,
+    device_map="auto"
+)
+
+generator = TextGenerationPipeline(
+    model=model,
+    tokenizer=tokenizer,
+    max_new_tokens=220,
+    do_sample=False,
+)
+
+# -------------------------
+# RAG logic
+# -------------------------
+def retrieve_docs(query: str) -> List[Document]:
+    vs = load_faiss_index(INDEX_DIR)
+    return vs.similarity_search(query, k=TOP_K)
 
 
-def _build_context(docs) -> str:
-    """Safely build context string from retrieved documents."""
-    context_parts = []
-    total_chars = 0
-
-    for d in docs:
-        text = d.page_content.strip()
-        if not text:
-            continue
-
-        if total_chars + len(text) > MAX_CONTEXT_CHARS:
-            break
-
-        context_parts.append(text)
-        total_chars += len(text)
-
-    return "\n\n".join(context_parts)
+def extract_facts(docs: List[Document]) -> str:
+    text = " ".join(
+        d.page_content.replace("\n", " ").strip()
+        for d in docs
+    )
+    return text[:MAX_FACT_CHARS]
 
 
-def answer_query(question: str) -> Tuple[str, List]:
-    """
-    Run retrieval + generation.
-    Returns:
-        answer (str)
-        source_docs (List[Document])
-    """
+def build_prompt(question: str, facts: str) -> str:
+    return f"""
+You are a financial economics researcher.
 
-    # 1. Load vector store
-    vectorstore = load_faiss_index(INDEX_DIR)
+TASK:
+- Give a clear definition
+- Explain the economic or statistical mechanism
+- Do NOT quote text
+- Do NOT mention authors or papers
+- Write 4–6 sentences
 
-    # 2. Retrieve documents
-    docs = vectorstore.similarity_search(question, k=TOP_K)
-
-    if not docs:
-        return "Insufficient evidence in the provided documents.", []
-
-    # 3. Build context
-    context = _build_context(docs)
-
-    if not context.strip():
-        return "Insufficient evidence in the provided documents.", docs
-
-    # 4. Prompt (relaxed but grounded)
-    prompt = f"""
-You are answering using ONLY the provided academic context.
-
-CONTEXT:
-{context}
+FACTS:
+{facts}
 
 QUESTION:
 {question}
 
-INSTRUCTIONS:
-- Explain how the concept is described, defined, or analyzed in the papers
-- Summarize the mechanism or empirical pattern discussed
-- Do NOT add external knowledge
-- If the papers do not meaningfully discuss the concept, answer exactly:
-  "Insufficient evidence in the provided documents."
-
 ANSWER:
 """.strip()
 
-    # 5. Load model lazily
-    generator = pipeline(
-        "text2text-generation",
-        model=GEN_MODEL,
-        max_new_tokens=120,
-        do_sample=False
-    )
 
-    # 6. Generate
-    result = generator(prompt)[0]["generated_text"].strip()
+def answer_query(query: str) -> Tuple[str, List[Document]]:
+    docs = retrieve_docs(query)
+    facts = extract_facts(docs)
+    prompt = build_prompt(query, facts)
 
-    # 7. Final guardrail (semantic, not word-count)
-    if result.lower().startswith("insufficient"):
-        return "Insufficient evidence in the provided documents.", docs
+    output = generator(prompt)[0]["generated_text"]
+    answer = output.split("ANSWER:")[-1].strip()
 
-    return result, docs
+    if len(answer.split()) < 15:
+        answer = (
+            "The concept is discussed in the literature, but the extracted "
+            "material does not contain a clear explanatory passage."
+        )
+
+    return answer, docs

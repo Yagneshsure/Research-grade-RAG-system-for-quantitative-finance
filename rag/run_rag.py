@@ -8,23 +8,6 @@ sys.path.append(PROJECT_ROOT)
 from rag_pipeline import answer_query
 
 
-def print_sources(docs):
-    seen = set()
-    for i, doc in enumerate(docs, 1):
-        meta = getattr(doc, "metadata", {})
-        key = (meta.get("source"), meta.get("page"))
-
-        if key in seen:
-            continue
-        seen.add(key)
-
-        source = meta.get("source", "Unknown")
-        domain = meta.get("domain", "Unknown")
-        page = meta.get("page", "?")
-
-        print(f"{i}. {source} ({domain}, page {page})")
-
-
 if __name__ == "__main__":
     queries = [
         "What is volatility clustering?",
@@ -43,7 +26,15 @@ if __name__ == "__main__":
         print(answer)
 
         print("\nSOURCES USED:")
-        if sources:
-            print_sources(sources)
-        else:
-            print("None")
+        seen = set()
+        for i, doc in enumerate(sources, 1):
+            meta = doc.metadata
+            key = (meta["source"], meta["page"])
+            if key in seen:
+                continue
+            seen.add(key)
+
+            print(
+                f"{i}. {meta['source']} "
+                f"({meta['domain']}, page {meta['page']})"
+            )
